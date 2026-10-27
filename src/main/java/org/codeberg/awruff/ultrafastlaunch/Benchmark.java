@@ -48,6 +48,7 @@ final class Benchmark {
     private void report() {
         long transformMs = transformNanos.get() / 1_000_000;
         long uptimeMs = lastTransform == 0 ? 0 : lastTransform - jvmStart;
+        String mode = this.mode + "+" + AotCache.label();
         Log.info(LogCategory.MIXIN, "[UltraFastLaunch] Benchmark (%s): %d classes, %d hits, %d misses, %d uncached, %d ms transforming, last transform at %d ms uptime",
                 mode, classes.get(), hits.get(), misses.get(), uncached.get(), transformMs, uptimeMs);
 

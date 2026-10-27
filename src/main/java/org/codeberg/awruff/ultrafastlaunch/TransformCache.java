@@ -215,7 +215,14 @@ final class TransformCache {
         flusher.start();
     }
 
-    static List<String> computeFingerprint() throws IOException {
+    private static List<String> sharedFingerprint;
+
+    static synchronized List<String> computeFingerprint() throws IOException {
+        if (sharedFingerprint == null) sharedFingerprint = Collections.unmodifiableList(readFingerprint());
+        return sharedFingerprint;
+    }
+
+    private static List<String> readFingerprint() throws IOException {
         FabricLoader loader = FabricLoader.getInstance();
         List<String> lines = new ArrayList<>();
 

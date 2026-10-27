@@ -4,9 +4,6 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.impl.util.log.Log;
 import net.fabricmc.loader.impl.util.log.LogCategory;
 
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
-import javax.management.openmbean.CompositeData;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -56,7 +53,26 @@ final class AotCache {
     private static final Pattern NOT_FOR_ASSEMBLY = Pattern.compile(
             "-XX:[+-]?(AOT|SharedArchiveFile|VMOptionsFile).*|-Xshare:.*|-Djava\\.class\\.path=.*|-D" + Pattern.quote(MARKER_PROPERTY) + "=.*|-(javaagent|agentlib|agentpath):.*");
 
+    private static volatile String label = "aot-unfinished";
+
     private AotCache() {
+    }
+
+    static void start() {
+        Thread thread = new Thread(() -> {
+            try {
+                label = update();
+            } catch (Throwable t) {
+                label = "aot-error";
+                Log.warn(LogCategory.GENERAL, "[UltraFastLaunch] Could not update the AOT cache options", t);
+            }
+        }, "UltraFastLaunch AOT");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    static String label() {
+        return label;
     }
 
     static Path optionsFile() {
@@ -66,18 +82,19 @@ final class AotCache {
     /**
      * Writes the options for the next launch and returns a short label describing this launch, for the benchmark.
      */
-    static String update() {
+    private static String update() {
         Path options = optionsFile().toAbsolutePath().normalize();
         boolean argumentSet = System.getProperty(MARKER_PROPERTY) != null;
-        String mode = vmOption("AOTMode");
-        String using = vmOption("AOTCache");
-        String recording = vmOption("AOTConfiguration");
+        List<String> args = ManagementFactory.getRuntimeMXBean().getInputArguments();
+        String using = flag(args, "AOTCache");
+        String recording = flag(args, "AOTConfiguration");
+        boolean recordingNow = "record".equals(flag(args, "AOTMode")) || flag(args, "AOTCacheOutput") != null;
 
         if ("false".equals(System.getProperty(DISABLE_PROPERTY))) {
             writeOptions(options, Collections.<String>emptyList());
             return "aot-off";
         }
-        if (javaVersion() < MIN_JAVA || mode == null || using == null || recording == null) {
+        if (javaVersion() < MIN_JAVA) {
             writeOptions(options, Collections.<String>emptyList());
             if (argumentSet) {
                 Log.info(LogCategory.GENERAL, "[UltraFastLaunch] The AOT cache needs Java %d or newer, this is Java %s", MIN_JAVA, System.getProperty("java.version"));
@@ -86,14 +103,13 @@ final class AotCache {
         }
 
         String classPath = System.getProperty("java.class.path", "");
-        String key = key(classPath);
+        String key = key(classPath, args);
         Path dir = TransformCache.directory().resolve("aot").toAbsolutePath().normalize();
         Path cache = dir.resolve(PREFIX + key + ".aot");
         Path config = dir.resolve(PREFIX + key + ".aotconf");
         Path lock = dir.resolve(PREFIX + key + ".lock");
         Path log = dir.resolve(PREFIX + key + ".log");
         Path stateFile = dir.resolve("state.properties");
-        boolean recordingNow = "record".equals(mode);
         boolean recordingThis = recordingNow && samePath(recording, config);
 
         String label;
@@ -132,7 +148,7 @@ final class AotCache {
                 next.add("-XX:AOTCache=" + cache);
             } else if (failures >= MAX_FAILURES) {
                 Log.warn(LogCategory.GENERAL, "[UltraFastLaunch] Building the AOT cache failed %d times, see %s. Not retrying until Java, the class path or mods change, or %s is deleted", failures, log, stateFile);
-            } else if (startAssembler(config, cache, lock, log, classPath)) {
+            } else if (startAssembler(config, cache, lock, log, classPath, args)) {
                 failures++;
                 next.add("-XX:AOTCache=" + cache);
                 Log.info(LogCategory.GENERAL, "[UltraFastLaunch] Building the AOT cache in the background. Launches after it finishes will use it");
@@ -180,11 +196,11 @@ final class AotCache {
      * class path must match exactly or the JVM ignores the cache, mod changes invalidate the cached Mixin output, and
      * GC/object layout flags change what the JVM can map from the cache.
      */
-    private static String key(String classPath) {
+    private static String key(String classPath, List<String> args) {
         List<String> lines = new ArrayList<>();
         lines.add("vm=" + System.getProperty("java.vm.vendor") + "|" + System.getProperty("java.vm.version") + "|" + System.getProperty("java.home"));
         lines.add("cp=" + classPath);
-        for (String arg : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
+        for (String arg : args) {
             if (arg.matches("-XX:[+-]Use\\w*GC") || arg.matches("-XX:[+-]Use(CompressedOops|CompressedClassPointers|CompactObjectHeaders)")) {
                 lines.add("arg=" + arg);
             }
@@ -212,7 +228,7 @@ final class AotCache {
         }
     }
 
-    private static boolean startAssembler(Path config, Path cache, Path lock, Path log, String classPath) {
+    private static boolean startAssembler(Path config, Path cache, Path lock, Path log, String classPath, List<String> args) {
         try {
             Path jar = Paths.get(AotCache.class.getProtectionDomain().getCodeSource().getLocation().toURI());
             String java = javaExecutable();
@@ -220,7 +236,7 @@ final class AotCache {
 
             List<String> command = new ArrayList<>(Arrays.asList(java, "-Xmx64m", "-XX:TieredStopAtLevel=1", "-cp", jar.toString(),
                     AotAssembler.class.getName(), lock.toString(), tmp.toString(), cache.toString(), java));
-            for (String arg : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
+            for (String arg : args) {
                 if (!NOT_FOR_ASSEMBLY.matcher(arg).matches()) command.add(arg);
             }
             command.add("-XX:AOTMode=create");
@@ -299,19 +315,13 @@ final class AotCache {
         }
     }
 
-    /**
-     * Reads a HotSpot flag. Returns null if the flag doesn't exist in this JVM and "" if it's unset.
-     */
-    private static String vmOption(String name) {
-        try {
-            MBeanServer server = ManagementFactory.getPlatformMBeanServer();
-            CompositeData option = (CompositeData) server.invoke(new ObjectName("com.sun.management:type=HotSpotDiagnostic"),
-                    "getVMOption", new Object[]{name}, new String[]{String.class.getName()});
-            Object value = option.get("value");
-            return value == null ? "" : value.toString();
-        } catch (Exception e) {
-            return null;
+    private static String flag(List<String> args, String name) {
+        String prefix = "-XX:" + name + "=";
+        String value = null;
+        for (String arg : args) {
+            if (arg.startsWith(prefix)) value = arg.substring(prefix.length());
         }
+        return value;
     }
 
     private static int javaVersion() {
